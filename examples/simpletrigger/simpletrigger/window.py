@@ -24,6 +24,6 @@ schedule.every(30).seconds.do(emitWindow)
 
 if __name__ == "__main__":
     emitWindow()
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    # while True:
+    #     schedule.run_pending()
+    #     time.sleep(1)
