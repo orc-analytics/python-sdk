@@ -9,6 +9,7 @@ which are managed by Orca-core.
 import re
 import sys
 import asyncio
+import hashlib
 import logging
 import datetime as dt
 import traceback
@@ -28,6 +29,7 @@ from typing import (
     Any,
     Dict,
     List,
+    Tuple,
     Union,
     TypeVar,
     Callable,
@@ -36,6 +38,7 @@ from typing import (
     Protocol,
     Generator,
     AsyncGenerator,
+    cast,
 )
 from inspect import signature
 from concurrent import futures
@@ -176,14 +179,56 @@ class Window:
 
 
 @dataclass
+class DependencyResultRow:
+    window: Window
+    result: float | List[float] | Dict[str, Any] | None
+
+
+@dataclass
+class DependencyAlgorithm:
+    name: str
+    version: str
+    description: str
+
+    @property
+    def full_name(self):
+        return f"{self.name}_{self.version}"
+
+    @property
+    def id(self):
+        return f"{self.name}_{self.version}"
+
+
+@dataclass
+class DependencyResult:
+    algorithm: DependencyAlgorithm
+    results: List[DependencyResultRow]
+
+
+@dataclass
+class Dependencies:
+    _dependencies: Optional[Dict[str, DependencyResult]] = None
+
+    def get_result(self, algorithmFn: "AlgorithmFn") -> DependencyResult | None:
+        if self._dependencies is None:
+            return None
+        algo_name = getattr(algorithmFn, "_name", None)
+        algo_version = getattr(algorithmFn, "_version", None)
+        if algo_name is None or algo_version is None:
+            return None
+        full_qual_name = f"{algo_name}_{algo_version}"
+        return self._dependencies.get(full_qual_name, None)
+
+
+@dataclass
 class ExecutionParams:
     window: Window
-    dependencies: Optional[Iterable[pb.AlgorithmResult]] = None
+    dependencies: Optional[Dependencies] = None
 
     def __init__(
         self,
         window: Window | pb.Window,
-        dependencies: Optional[Iterable[pb.AlgorithmResult]] = None,
+        dependencies: Optional[Dependencies] = None,
     ):
         if isinstance(window, Window):
             self.window = window
@@ -199,12 +244,6 @@ class ExecutionParams:
         self.dependencies = dependencies
 
 
-class AlgorithmFn(Protocol):
-    def __call__(
-        self, params: ExecutionParams, *args: Any, **kwargs: Any
-    ) -> returnResult: ...
-
-
 @dataclass
 class RemoteAlgorithm:
     ProcessorName: str
@@ -212,25 +251,45 @@ class RemoteAlgorithm:
     Name: str
     Version: str
 
+    @property
+    def full_name(self) -> str:
+        """Returns the full name as `name_version`."""
+        return f"{self.Name}_{self.Version}"
 
-@dataclass
-class Lookback(AlgorithmFn):
-    """Defines a lookback period in an algorithm dependency"""
 
-    _algorithm: AlgorithmFn = field(repr=False)
-
-    def __init__(self, algorithm: AlgorithmFn, td: dt.timedelta, n: int) -> None:
-        self.__dict__.update(algorithm.__dict__)
-
-        self._algorithm = algorithm
-
-        self._lookback_td = td
-        self._lookback_n = n
+class AlgorithmFn(Protocol):
+    __slots__ = ("_lookback_n", "_lookback_td", "_name", "_version")
 
     def __call__(
         self, params: ExecutionParams, *args: Any, **kwargs: Any
-    ) -> returnResult:
-        return self._algorithm(params, *args, **kwargs)
+    ) -> returnResult: ...
+
+
+def get_id(algorithm: AlgorithmFn) -> str:
+    """Get the fully qualified ID of the algorithm"""
+    algo_name = getattr(algorithm, "_name", None)
+    algo_version = getattr(algorithm, "_version", None)
+    if algo_name is None or algo_version is None:
+        raise Exception(
+            "Unexpected issue - algorithm name, version and runtime cannot be determined from algorithm function "
+        )
+    full_qual_name = f"{algo_name}_{algo_version}"
+    return full_qual_name
+
+
+def lookback(
+    algorithm: AlgorithmFn,
+    td: dt.timedelta | None = None,
+    n: int | None = None,
+) -> AlgorithmFn:
+    """Annotate a function with lookback metadata"""
+    if td is None and n is None:
+        raise ValueError("One of `td` and `n` should be provided")
+
+    algorithm._lookback_td = 0 if td is None else int(td.total_seconds() * 1e9) # need to be in nano seconds
+    algorithm._lookback_n = 0 if n is None else n
+
+    return algorithm
 
 
 T = TypeVar("T", bound=AlgorithmFn)
@@ -309,6 +368,12 @@ class Algorithm:
         return f"{self.name}_{self.version}"
 
     @property
+    def id(self) -> str:
+        """The globally unique identifier of this algorithm"""
+        hash = hashlib.md5(self.runtime.encode())
+        return f"{self.name}_{self.version}_{hash.hexdigest()}"
+
+    @property
     def full_window_name(self) -> str:
         """Returns the full window name as `window_name_window_version`."""
         return f"{self.window_type.name}_{self.window_type.version}"
@@ -330,6 +395,8 @@ class Algorithms:
         self._dependencyFns: Dict[str, List[AlgorithmFn]] = {}
         self._remoteDependencies: Dict[str, List[RemoteAlgorithm]] = {}
         self._window_triggers: Dict[str, List[Algorithm]] = {}
+        # maps the algorithm to the dependency, resulting in the lookback params
+        self._lookbacks: Dict[str, Dict[str, Tuple[int, int]]] = {}
 
     def _add_algorithm(self, name: str, algorithm: Algorithm) -> None:
         """
@@ -383,6 +450,14 @@ class Algorithms:
             else:
                 self._remoteDependencies[algorithm].append(remoteAlgo)
 
+            # add the lookback
+            self._add_lookback(
+                algorithm,
+                remoteAlgo.full_name,
+                getattr(dependency, "_lookback_n", 0),
+                getattr(dependency, "_lookback_td", 0),
+            )
+
             return
 
         dependencyAlgo = None
@@ -402,6 +477,14 @@ class Algorithms:
         else:
             self._dependencyFns[algorithm].append(dependency)
             self._dependencies[algorithm].append(dependencyAlgo)
+
+        # add the lookback
+        self._add_lookback(
+            algorithm,
+            dependencyAlgo.full_name,
+            getattr(dependency, "_lookback_n", 0),
+            getattr(dependency, "_lookback_td", 0),
+        )
 
     def _add_window_trigger(self, window: str, algorithm: Algorithm) -> None:
         """Associates an algorithm with a triggering window."""
@@ -424,6 +507,27 @@ class Algorithms:
             if algorithm.exec_fn == algorithm_fn:
                 return True
         return False
+
+    def _add_lookback(
+        self, algoFrom: str, algoTo: str, n: int = 0, td: int = 0
+    ) -> None:
+        """
+        Adds a lookback for a given algorithm (from) and
+        it's dependency (to)
+        """
+        self._lookbacks.update({algoFrom: {algoTo: (n, td)}})
+
+    def _get_lookback(self, algoFrom: str, algoTo: str) -> Tuple[int, int]:
+        """
+        Gets the lookback for a given algorithm (from) and
+        its dependency (to)
+        """
+        toDict = self._lookbacks.get(algoFrom, None)
+
+        if toDict is None:
+            return (0, 0)
+
+        return toDict.get(algoTo, (0, 0))
 
 
 # the orca processor
@@ -452,7 +556,8 @@ class Processor(OrcaProcessorServicer):  # type: ignore
         self,
         exec_id: str,
         algorithm: pb.Algorithm,
-        params: ExecutionParams,
+        window: pb.Window,
+        dependencies: Iterable[pb.AlgorithmDependencyResult],
     ) -> pb.ExecutionResult:
         """
         Executes a single algorithm with resolved dependencies.
@@ -474,28 +579,64 @@ class Processor(OrcaProcessorServicer):  # type: ignore
             algo = self._algorithmsSingleton._algorithms[algoName]
 
             # convert dependency results into a dict of name -> value
-            dependency_values = {}
-            if params.dependencies:
-                for dep_result in params.dependencies:
-                    # extract value based on which oneof field is set
-                    dep_value = None
-                    if dep_result.result.HasField("single_value"):
-                        dep_value = dep_result.result.single_value
-                    elif dep_result.result.HasField("float_values"):
-                        dep_value = list(dep_result.result.float_values.values)
-                    elif dep_result.result.HasField("struct_value"):
-                        dep_value = json_format.MessageToDict(
-                            dep_result.result.struct_value
+            dependency_results = {}
+            if dependencies:
+                for dep_result in dependencies:
+                    # initialise the sub array
+                    dependency = DependencyAlgorithm(
+                        name=dep_result.algorithm.name,
+                        version=dep_result.algorithm.version,
+                        description=dep_result.algorithm.description,
+                    )
+                    dependency_values = []
+
+                    for res in dep_result.result:
+                        # FIXME: Turn into a generator to better handle large results
+                        # extract value based on which oneof field is set
+                        dep_value = None
+                        if res.result.HasField("single_value"):
+                            dep_value = res.result.single_value
+                        elif res.result.HasField("float_values"):
+                            dep_value = list(res.result.float_values.values)
+                        elif res.result.HasField("struct_value"):
+                            dep_value = json_format.MessageToDict(
+                                res.result.struct_value
+                            )
+
+                        dependency_values.append(
+                            DependencyResultRow(
+                                result=dep_value,
+                                window=Window(
+                                    time_from=res.window.time_from.ToDatetime(dt.UTC),
+                                    time_to=res.window.time_to.ToDatetime(dt.UTC),
+                                    name=res.window.window_type_name,
+                                    version=res.window.window_type_version,
+                                    origin=res.window.origin,
+                                ),
+                            ),
                         )
 
-                    dep_name = (
-                        f"{dep_result.algorithm.name}_{dep_result.algorithm.version}"
+                    dependency_result = DependencyResult(
+                        algorithm=dependency, results=dependency_values
                     )
-                    dependency_values[dep_name] = dep_value
 
+                    dependency_results[dependency_result.algorithm.id] = (
+                        dependency_result
+                    )
+
+            params = ExecutionParams(
+                window=Window(
+                    time_from=window.time_from.ToDatetime(dt.UTC),
+                    time_to=window.time_to.ToDatetime(dt.UTC),
+                    name=window.window_type_name,
+                    version=window.window_type_version,
+                    origin=window.origin,
+                    metadata=cast(dict, window.metadata.fields),
+                ),
+                dependencies=Dependencies(_dependencies=dependency_results),
+            )
             # execute in thread pool since algo.exec_fn is synchronous
             loop = asyncio.get_event_loop()
-
             algoResult = await loop.run_in_executor(None, algo.exec_fn, params)
 
             # depending on algo result type, map to whatever instance
@@ -603,7 +744,7 @@ class Processor(OrcaProcessorServicer):  # type: ignore
 
         LOGGER.info(
             (
-                f"Received DAG execution request with {len(executionRequest.algorithms)} "
+                f"Received DAG execution request with {len(executionRequest.algorithm_executions)} "
                 f"algorithms and ExecId: {executionRequest.exec_id}"
             )
         )
@@ -620,13 +761,11 @@ class Processor(OrcaProcessorServicer):  # type: ignore
             tasks = [
                 self.execute_algorithm(
                     executionRequest.exec_id,
-                    algorithm,
-                    ExecutionParams(
-                        window=executionRequest.window,
-                        dependencies=executionRequest.algorithm_results,
-                    ),
+                    algorithm.algorithm,
+                    executionRequest.window,
+                    algorithm.dependencies,
                 )
-                for algorithm in executionRequest.algorithms
+                for algorithm in executionRequest.algorithm_executions
             ]
 
             # execute all tasks concurrently and yield results as they complete
@@ -736,26 +875,37 @@ class Processor(OrcaProcessorServicer):  # type: ignore
             # Add dependencies if they exist
             if algorithm.full_name in self._algorithmsSingleton._dependencies:
                 for dep in self._algorithmsSingleton._dependencies[algorithm.full_name]:
+                    lookback_num, lookback_td = self._algorithmsSingleton._get_lookback(
+                        algorithm.full_name, dep.full_name
+                    )
                     dep_msg = algo_msg.dependencies.add()
                     dep_msg.name = dep.name
                     dep_msg.version = dep.version
                     dep_msg.processor_name = dep.processor
                     dep_msg.processor_runtime = dep.runtime
-                    dep_msg.lookback_num = getattr(dep, "_lookback_num", 0)
-                    dep_msg.lookback_num = getattr(dep, "_lookback_td", 0)
+                    if lookback_num > 0:
+                        dep_msg.lookback_num = lookback_num
+                    elif lookback_td > 0:
+                        dep_msg.lookback_time_delta = lookback_td
 
             # Add remote dependencies if they exist
             if algorithm.full_name in self._algorithmsSingleton._remoteDependencies:
                 for remote_dep in self._algorithmsSingleton._remoteDependencies[
                     algorithm.full_name
                 ]:
+                    lookback_num, lookback_td = self._algorithmsSingleton._get_lookback(
+                        algorithm.full_name, remote_dep.full_name
+                    )
                     dep_msg = algo_msg.dependencies.add()
                     dep_msg.name = remote_dep.Name
                     dep_msg.version = remote_dep.Version
                     dep_msg.processor_name = remote_dep.ProcessorName
                     dep_msg.processor_runtime = remote_dep.ProcessorRuntime
-                    dep_msg.lookback_num = getattr(dep, "_lookback_num", 0)
-                    dep_msg.lookback_num = getattr(dep, "_lookback_td", 0)
+                    if lookback_num > 0:
+                        dep_msg.lookback_num = lookback_num
+                    elif lookback_td > 0:
+                        dep_msg.lookback_time_delta = lookback_td
+
         try:
             if envs.is_production:
                 # secure channel with TLS
@@ -949,6 +1099,10 @@ class Processor(OrcaProcessorServicer):  # type: ignore
             # TODO: check for circular dependencies. It's not easy to create one in python as the function
             # needs to be defined before a dependency can be created, and you can only register depencenies
             # once. But when dependencies are grabbed from a server, circular dependencies will be possible
+
+            # store details of the algorithm in the wrapper itself for utility purposes.
+            wrapper._name = name
+            wrapper._version = version
 
             return wrapper  # type: ignore[return-value]
 
