@@ -1,4 +1,3 @@
-import time
 import datetime as dt
 
 import schedule

@@ -286,7 +286,9 @@ def lookback(
     if td is None and n is None:
         raise ValueError("One of `td` and `n` should be provided")
 
-    algorithm._lookback_td = 0 if td is None else int(td.total_seconds() * 1e9) # need to be in nano seconds
+    algorithm._lookback_td = (
+        0 if td is None else int(td.total_seconds() * 1e9)
+    )  # need to be in nano seconds
     algorithm._lookback_n = 0 if n is None else n
 
     return algorithm
