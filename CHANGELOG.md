@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 
+## [v0.13.0] - 25-01-2026
+
+## Added
+
+- The primitives to add lookbacks to dependency results
+
+## Changed
+
+- Improved how dependency results are served within the algorithm
+
 ## [v0.12.0] - 03-01-2026
 
 ### Removed
